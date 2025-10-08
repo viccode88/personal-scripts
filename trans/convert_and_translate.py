@@ -1,43 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-把 .mobi 轉為 .epub，僅翻譯 EPUB 裡的 XHTML/XML 文字節點，保持原始排版、連結、圖片、CSS 不動。
-輸出：
-  - 全量：<原檔名>.<lang>.translated.epub
-  - 預覽：<原檔名>.<lang>.preview.epub + <原檔名>.<lang>.preview.tsv
-  - Self-test：<原檔名>.api-selftest.txt
-
-新增：
-  - 人名/專有名詞統一保留英文原名（提示詞規則）
-  - 多線程並發（--max-workers，最多 25）
-
-建議先預覽：
-  python mobi_epub_preserve_format_translate.py input.mobi --target zh-TW --model gpt-5 --preview-limit 150 --max-workers 25
-"""
 
 import argparse
-import json
 import os
-import re
-import shutil
 import sys
+import shutil
+import subprocess
+import zipfile
 import tempfile
 import time
-import zipfile
+import re
+import json
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+# 翻譯依賴
 from bs4 import BeautifulSoup, NavigableString, Comment, FeatureNotFound
-import subprocess
-
-# ---- OpenAI Responses API ----
 from openai import OpenAI
 
-# ------------------ EPUB / 轉檔 ------------------
+
+# ===================== 共同工具（Calibre / ebook-convert） =====================
 
 CALIBRE_DEFAULT = "/Applications/calibre.app/Contents/MacOS/ebook-convert"
+
 
 def resolve_ebook_convert() -> str:
     path = shutil.which("ebook-convert")
@@ -48,29 +35,107 @@ def resolve_ebook_convert() -> str:
     print("[ERROR] 找不到指令 `ebook-convert`。請安裝 Calibre 或把它加入 PATH。", file=sys.stderr)
     sys.exit(2)
 
-def mobi_to_epub(in_path: Path, out_epub: Path):
+
+def needs_convert(src: Path, dst: Path) -> bool:
+    if not dst.exists():
+        return True
+    if dst.stat().st_size == 0:
+        return True
+    return src.stat().st_mtime > dst.stat().st_mtime
+
+
+def convert_one(src: Path) -> tuple[Path, bool, str]:
+    dst = src.with_suffix(".epub")
+    if not needs_convert(src, dst):
+        return (src, False, "skip (already up-to-date)")
     cmd = [
         resolve_ebook_convert(),
-        str(in_path),
-        str(out_epub),
-        "--keep-ligatures",
-        "--no-default-epub-cover",
-        "--embed-all-fonts",
-        "--pretty-print",
+        str(src),
+        str(dst),
     ]
-    print(f"[INFO] 轉檔：{' '.join(cmd)}")
-    res = subprocess.run(cmd)
-    if res.returncode != 0:
-        raise RuntimeError("ebook-convert 執行失敗。")
-    if not out_epub.exists() or out_epub.stat().st_size == 0:
-        raise RuntimeError("轉檔後 EPUB 不存在或為空（可能是 DRM 或原檔損壞）。")
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return (src, True, "ok")
+        else:
+            return (src, True, f"failed (code={res.returncode})\nSTDERR:\n{res.stderr.strip()}")
+    except Exception as e:
+        return (src, True, f"exception: {e}")
+
+
+# ===================== convert 子指令（批量轉 EPUB） =====================
+
+
+def cmd_convert(args: argparse.Namespace) -> None:
+    base_dir = Path(args.base_dir).expanduser().resolve()
+    if not base_dir.exists():
+        print(f"[ERROR] 路徑不存在：{base_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    exts = set()
+    for e in (args.exts or ".mobi,.azw3").split(","):
+        e = e.strip().lower()
+        if not e:
+            continue
+        if not e.startswith("."):
+            e = "." + e
+        exts.add(e)
+
+    targets: List[Path] = []
+    for p in base_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            targets.append(p)
+
+    if not targets:
+        print("沒有找到任何待轉檔的來源檔案。")
+        return
+
+    print(f"找到 {len(targets)} 個檔案，開始轉檔…")
+    success, skipped, failed = 0, 0, 0
+    details_failed = []
+
+    max_workers = max(1, int(args.workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(convert_one, src): src for src in targets}
+        for fut in as_completed(futures):
+            src, attempted, msg = fut.result()
+            try:
+                rel = src.relative_to(base_dir)
+            except ValueError:
+                rel = src.name
+            if "ok" in msg:
+                success += 1
+                print(f"✅ {rel} -> ok")
+            elif msg.startswith("skip"):
+                skipped += 1
+                print(f"⏭️  {rel} -> {msg}")
+            else:
+                failed += 1
+                details_failed.append((rel, msg))
+                print(f"❌ {rel} -> {msg}")
+
+    print("\n=== 結算 ===")
+    print(f"成功：{success}")
+    print(f"跳過：{skipped}")
+    print(f"失敗：{failed}")
+    if failed:
+        print("\n失敗清單：")
+        for rel, msg in details_failed:
+            print(f"- {rel}\n  {msg}")
+
+
+# ===================== translate 子指令（保留排版翻譯） =====================
+
+SKIP_TAGS = {"script", "style", "head", "svg", "math"}
+TRANSLATE_ALT = True
+
 
 def unzip_epub(epub_path: Path, workdir: Path):
     with zipfile.ZipFile(epub_path, "r") as zf:
         zf.extractall(workdir)
 
+
 def rezip_epub(src_dir: Path, out_epub: Path):
-    # EPUB 慣例：mimetype 需置頂且不壓縮
     with zipfile.ZipFile(out_epub, "w") as zf:
         mimetype_file = src_dir / "mimetype"
         if mimetype_file.exists():
@@ -83,10 +148,6 @@ def rezip_epub(src_dir: Path, out_epub: Path):
                     continue
                 zf.write(p, str(rel), compress_type=zipfile.ZIP_DEFLATED)
 
-# ------------------ HTML/XML 文字抽取 / 回填 ------------------
-
-SKIP_TAGS = {"script", "style", "head", "svg", "math"}
-TRANSLATE_ALT = True  # 是否翻譯 <img alt="...">
 
 def iter_text_nodes(soup: BeautifulSoup) -> Iterable[Tuple[NavigableString, str]]:
     for node in soup.descendants:
@@ -101,6 +162,7 @@ def iter_text_nodes(soup: BeautifulSoup) -> Iterable[Tuple[NavigableString, str]
                 continue
             yield node, text
 
+
 def extract_alt_texts(soup: BeautifulSoup) -> List[Tuple[Any, str]]:
     items: List[Tuple[Any, str]] = []
     if not TRANSLATE_ALT:
@@ -110,6 +172,16 @@ def extract_alt_texts(soup: BeautifulSoup) -> List[Tuple[Any, str]]:
         if alt and re.search(r"\S", alt):
             items.append((img, alt))
     return items
+
+
+def parse_with_best_parser(text: str) -> BeautifulSoup:
+    for parser in ("lxml-xml", "xml", "html.parser"):
+        try:
+            return BeautifulSoup(text, parser)
+        except FeatureNotFound:
+            continue
+    raise RuntimeError("沒有可用的 BeautifulSoup 解析器（請安裝 lxml 或 html5lib）。")
+
 
 def batch_texts(texts: List[str], max_chars: int) -> List[List[str]]:
     batches, buf, size = [], [], 0
@@ -133,7 +205,6 @@ def batch_texts(texts: List[str], max_chars: int) -> List[List[str]]:
         batches.append(buf)
     return batches
 
-# ------------------ OpenAI 翻譯 / 自我測試 ------------------
 
 def make_system_prompt(target_lang: str) -> str:
     return (
@@ -146,34 +217,12 @@ def make_system_prompt(target_lang: str) -> str:
         "4) Return translations in the SAME order, one per segment, aligned with inputs.\n"
         "5) Do not translate HTML/XML tags or entities; only translate human-readable text.\n"
         "6) CRITICAL: Preserve all ENGLISH proper nouns (people names, places, organizations, product/series titles) "
-        "EXACTLY as in the source (no translation, no transliteration). Examples: 'Nora Sutherlin', 'New York', "
-        "'Harlequin Enterprises Limited'."
+        "EXACTLY as in the source (no translation, no transliteration)."
     )
 
-def openai_self_test(client: OpenAI, model: str, target_lang: str, out_txt: Path):
-    """小小煙霧測試：確認 API 可用且能翻出內容。"""
-    sys_prompt = "You are a helpful translator."
-    user_prompt = f"Translate the following short line into {target_lang}:\nThis is a translation health check for EPUB batch translation."
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        text={"format": {"type": "text"}, "verbosity": "medium"},
-        reasoning={"effort": "medium", "summary": "auto"},
-        tools=[],
-        store=True,
-    )
-    text = (resp.output_text or "").strip()
-    if not text:
-        raise RuntimeError("Self-test 失敗：API 回傳空白。")
-    out_txt.write_text(text + "\n", encoding="utf-8")
-    print(f"[SELF-TEST] OK → {out_txt.name}: {text[:80]}{'...' if len(text)>80 else ''}")
-
-# ---- 併發批次翻譯（多線程） ----
 
 _ckpt_lock = threading.Lock()
+
 
 def _translate_one_batch(
     batch_index: int,
@@ -182,10 +231,8 @@ def _translate_one_batch(
     model: str,
     sys_prompt: str,
     max_retries: int,
-    sleep_base: float,
     checkpoint_path: Optional[Path],
 ) -> Tuple[int, List[str]]:
-    """執行單一批次（含重試/退避），回傳 (batch_index, parts)。"""
     inp = "\n---\n".join(batch)
     user_prompt = (
         "Translate each segment below, preserving order. "
@@ -221,7 +268,10 @@ def _translate_one_batch(
             if checkpoint_path:
                 with _ckpt_lock:
                     with checkpoint_path.open("a", encoding="utf-8") as w:
-                        w.write(json.dumps({"batch": batch_index, "ok": True, "parts": parts}, ensure_ascii=False) + "\n")
+                        w.write(
+                            json.dumps({"batch": batch_index, "ok": True, "parts": parts}, ensure_ascii=False)
+                            + "\n"
+                        )
             return batch_index, parts
 
         except Exception as e:
@@ -229,12 +279,33 @@ def _translate_one_batch(
             sys.stderr.write(f"[WARN] 批次 {batch_index} 第 {attempt} 次失敗：{e}；{wait:.1f}s 後重試…\n")
             time.sleep(wait)
 
-    # 到這裡代表失敗
     if checkpoint_path:
         with _ckpt_lock:
             with checkpoint_path.open("a", encoding="utf-8") as w:
                 w.write(json.dumps({"batch": batch_index, "ok": False, "error": "max retries reached"}, ensure_ascii=False) + "\n")
     raise RuntimeError(f"批次 {batch_index} 重試仍失敗")
+
+
+def openai_self_test(client: OpenAI, model: str, target_lang: str, out_txt: Path):
+    sys_prompt = "You are a helpful translator."
+    user_prompt = f"Translate the following short line into {target_lang}:\nThis is a translation health check for EPUB batch translation."
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        text={"format": {"type": "text"}, "verbosity": "medium"},
+        reasoning={"effort": "medium", "summary": "auto"},
+        tools=[],
+        store=True,
+    )
+    text = (resp.output_text or "").strip()
+    if not text:
+        raise RuntimeError("Self-test 失敗：API 回傳空白。")
+    out_txt.write_text(text + "\n", encoding="utf-8")
+    print(f"[SELF-TEST] OK → {out_txt.name}: {text[:80]}{'...' if len(text)>80 else ''}")
+
 
 def translate_text_list_concurrent(
     client: OpenAI,
@@ -247,11 +318,9 @@ def translate_text_list_concurrent(
     max_retries: int = 7,
     checkpoint_path: Optional[Path] = None,
 ) -> List[str]:
-    """多線程並發翻譯，批次並行但輸出順序與輸入對齊。"""
     sys_prompt = make_system_prompt(target_lang)
     batches = batch_texts(items, max_chars_per_call)
 
-    # 讀取既有 checkpoint（允許任意批次完成）
     done: Dict[int, List[str]] = {}
     if checkpoint_path and checkpoint_path.exists():
         for line in checkpoint_path.read_text(encoding="utf-8").splitlines():
@@ -263,13 +332,11 @@ def translate_text_list_concurrent(
                 continue
 
     pending_idx = [i for i in range(1, len(batches) + 1) if i not in done]
-    outputs_by_batch: Dict[int, List[str]] = dict(done)  # 先塞已完成
+    outputs_by_batch: Dict[int, List[str]] = dict(done)
 
     if pending_idx:
-        max_workers = max(1, min(int(max_workers), 25))  # 上限 25
-        print(f"[INFO] 併發執行：{len(pending_idx)} 批待處理，max_workers={max_workers}")
+        max_workers = max(1, min(int(max_workers), 25))
 
-        # 每個線程用自己的 client（更保險）
         def make_client() -> OpenAI:
             return OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -278,8 +345,7 @@ def translate_text_list_concurrent(
             for i in pending_idx:
                 c = make_client()
                 fut = ex.submit(
-                    _translate_one_batch, i, batches[i-1], c, model, sys_prompt,
-                    max_retries, sleep_base=1.0, checkpoint_path=checkpoint_path
+                    _translate_one_batch, i, batches[i - 1], c, model, sys_prompt, max_retries, checkpoint_path
                 )
                 futures[fut] = i
 
@@ -288,7 +354,6 @@ def translate_text_list_concurrent(
                 outputs_by_batch[i] = parts
                 print(f"[INFO] 批次 {i} 完成（{len(parts)} 段）")
 
-    # 重建輸出（照批次順序串回）
     outputs: List[str] = []
     for i in range(1, len(batches) + 1):
         parts = outputs_by_batch.get(i)
@@ -297,35 +362,43 @@ def translate_text_list_concurrent(
         outputs.extend(parts)
     return outputs
 
-# ------------------ 主流程 ------------------
 
-def parse_with_best_parser(text: str) -> BeautifulSoup:
-    """優先用 lxml-xml；沒裝就退回 'xml' 或 html.parser。"""
-    for parser in ("lxml-xml", "xml", "html.parser"):
-        try:
-            return BeautifulSoup(text, parser)
-        except FeatureNotFound:
-            continue
-    raise RuntimeError("沒有可用的 BeautifulSoup 解析器（請安裝 lxml 或 html5lib）。")
+def cmd_translate(args: argparse.Namespace) -> None:
+    in_path = Path(args.input).expanduser().resolve()
+    if not in_path.exists():
+        print(f"[ERROR] 找不到檔案：{in_path}", file=sys.stderr)
+        sys.exit(1)
 
-def translate_epub_texts(
-    epub_in: Path,
-    epub_out_full: Path,
-    target_lang: str,
-    model: str,
-    *,
-    max_chars_per_call: int = 3500,
-    preview_limit: int = 0,
-    max_workers: int = 10,
-):
+    base = in_path.with_suffix(".epub") if in_path.suffix.lower() == ".mobi" else in_path
+    out_epub = base.with_name(f"{base.stem}.{args.target}.translated.epub")
+
+    if in_path.suffix.lower() == ".mobi" and not args.skip_convert:
+        tmp_epub = in_path.with_suffix(".tmp.convert.epub")
+        cmd = [resolve_ebook_convert(), str(in_path), str(tmp_epub), "--keep-ligatures", "--no-default-epub-cover", "--embed-all-fonts", "--pretty-print"]
+        print(f"[INFO] 轉檔：{' '.join(cmd)}")
+        res = subprocess.run(cmd)
+        if res.returncode != 0:
+            print("[ERROR] ebook-convert 執行失敗。", file=sys.stderr)
+            sys.exit(2)
+        if not tmp_epub.exists() or tmp_epub.stat().st_size == 0:
+            print("[ERROR] 轉檔後 EPUB 不存在或為空（可能是 DRM 或原檔損壞）。", file=sys.stderr)
+            sys.exit(2)
+        src_epub = tmp_epub
+    else:
+        if in_path.suffix.lower() != ".epub":
+            print("[ERROR] 略過轉檔僅適用於 EPUB 輸入；請移除 --skip-convert 或提供 .epub。", file=sys.stderr)
+            sys.exit(1)
+        src_epub = in_path
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("尚未設定 OPENAI_API_KEY")
+        print("[ERROR] 尚未設定 OPENAI_API_KEY", file=sys.stderr)
+        sys.exit(2)
     client = OpenAI(api_key=api_key)
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        unzip_epub(epub_in, tmp)
+        unzip_epub(src_epub, tmp)
 
         html_files: List[Path] = []
         for ext in ("*.xhtml", "*.html", "*.htm"):
@@ -345,28 +418,27 @@ def translate_epub_texts(
                 node_refs.append((f, node))
                 texts.append(text)
                 total_nodes += 1
-                if preview_limit and total_nodes >= preview_limit:
+                if args.preview_limit and total_nodes >= args.preview_limit:
                     break
 
-            if not preview_limit or total_nodes < preview_limit:
+            if not args.preview_limit or total_nodes < args.preview_limit:
                 for img, alt in extract_alt_texts(soup):
                     alt_refs.append((img, alt))
                     texts.append(alt)
                     total_nodes += 1
-                    if preview_limit and total_nodes >= preview_limit:
+                    if args.preview_limit and total_nodes >= args.preview_limit:
                         break
 
-            if preview_limit and total_nodes >= preview_limit:
+            if args.preview_limit and total_nodes >= args.preview_limit:
                 break
 
-        # === Self-test：先確認 API 正常 ===
-        selftest_path = epub_in.with_suffix(".api-selftest.txt")
-        openai_self_test(client, model, target_lang, selftest_path)
+        selftest_path = in_path.with_suffix(".api-selftest.txt")
+        openai_self_test(client, args.model, args.target, selftest_path)
 
         if not texts:
             print("[INFO] 沒有可翻譯文字（或已達 preview 限制）。")
-            out_path = epub_out_full if preview_limit == 0 else epub_out_full.with_name(
-                epub_out_full.name.replace(".translated.", ".preview.")
+            out_path = out_epub if args.preview_limit == 0 else out_epub.with_name(
+                out_epub.name.replace(".translated.", ".preview.")
             )
             rezip_epub(tmp, out_path)
             print(f"[DONE] 已輸出（未改動）：{out_path}")
@@ -374,23 +446,22 @@ def translate_epub_texts(
 
         print(f"[INFO] 將翻譯 {len(texts)} 個原子字串（文字節點 + alt）。")
 
-        ckpt = (epub_in.parent / "translated_batches.jsonl")
+        ckpt = (in_path.parent / "translated_batches.jsonl")
         translations = translate_text_list_concurrent(
             client=client,
-            model=model,
-            target_lang=target_lang,
+            model=args.model,
+            target_lang=args.target,
             items=texts,
-            max_chars_per_call=max_chars_per_call,
-            max_workers=max_workers,
+            max_chars_per_call=args.max_chars_per_call,
+            max_workers=args.max_workers,
             max_retries=7,
             checkpoint_path=ckpt,
         )
         assert len(translations) == len(texts)
 
-        # 回填（只回填前 preview_limit 個原子字串；若為全量則全部回填）
-        limit = len(texts) if preview_limit == 0 else preview_limit
+        limit = len(texts) if args.preview_limit == 0 else args.preview_limit
         t_i = 0
-        replaced_pairs: List[Tuple[str, str]] = []  # for preview.tsv
+        replaced_pairs: List[Tuple[str, str]] = []
         for f, node in node_refs:
             if t_i >= limit:
                 break
@@ -406,14 +477,12 @@ def translate_epub_texts(
             img["alt"] = new_alt
             t_i += 1
 
-        # 寫回所有 soup
         for f, soup in soup_map.items():
             f.write_text(str(soup), encoding="utf-8")
 
-        if preview_limit > 0:
-            out_preview = epub_out_full.with_name(epub_out_full.name.replace(".translated.", ".preview."))
+        if args.preview_limit > 0:
+            out_preview = out_epub.with_name(out_epub.name.replace(".translated.", ".preview."))
             rezip_epub(tmp, out_preview)
-            # 產出 TSV 預覽（原文\t譯文）
             tsv_path = out_preview.with_suffix(".tsv")
             with tsv_path.open("w", encoding="utf-8") as w:
                 for src, tgt in replaced_pairs:
@@ -421,58 +490,42 @@ def translate_epub_texts(
             print(f"[DONE] 預覽輸出：{out_preview}")
             print(f"[DONE] 對照表：{tsv_path}")
         else:
-            rezip_epub(tmp, epub_out_full)
-            print(f"[DONE] 全量輸出：{epub_out_full}")
+            rezip_epub(tmp, out_epub)
+            print(f"[DONE] 全量輸出：{out_epub}")
 
-# ------------------ CLI ------------------
+
+# ===================== 主 CLI =====================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Ebook convert and translate (preserve layout/images).")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    ap_c = sub.add_parser("convert", help="批量將 .mobi/.azw3 轉為 .epub")
+    ap_c.add_argument("--base-dir", required=True, help="掃描根目錄")
+    ap_c.add_argument("--exts", default=".mobi,.azw3", help="來源副檔名，逗號分隔（含或不含點）")
+    ap_c.add_argument("--workers", type=int, default=8, help="併發度（預設 8）")
+    ap_c.set_defaults(func=cmd_convert)
+
+    ap_t = sub.add_parser("translate", help="翻譯 EPUB/MOBI，可保留原始排版與圖片")
+    ap_t.add_argument("input", help="輸入檔（.mobi 或 .epub）")
+    ap_t.add_argument("--target", default="zh-TW", help="目標語言，預設 zh-TW")
+    ap_t.add_argument("--model", default="gpt-5", help="OpenAI 模型，例如 gpt-5 或 gpt-5-mini")
+    ap_t.add_argument("--skip-convert", action="store_true", help="輸入已是 EPUB，跳過 MOBI→EPUB 轉檔")
+    ap_t.add_argument("--max-chars-per-call", type=int, default=3500, help="每次 API 呼叫最大字元數")
+    ap_t.add_argument("--preview-limit", type=int, default=0, help="僅翻譯前 N 個原子字串（試跑/抽樣）")
+    ap_t.add_argument("--max-workers", type=int, default=10, help="同時並發批次數（1~25）")
+    ap_t.set_defaults(func=cmd_translate)
+
+    return ap
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Translate MOBI/EPUB to target language while preserving layout/images.")
-    ap.add_argument("input", type=str, help=".mobi 或 .epub 檔")
-    ap.add_argument("--target", type=str, default="zh-TW", help="目標語言（預設 zh-TW）")
-    ap.add_argument("--model", type=str, default="gpt-5", help="OpenAI 模型，例如 gpt-5 或 gpt-5-mini")
-    ap.add_argument("--skip-convert", action="store_true", help="輸入已是 EPUB，跳過 MOBI→EPUB 轉檔")
-    ap.add_argument("--max-chars-per-call", type=int, default=3500, help="每次 API 呼叫的最大字元數")
-    ap.add_argument("--preview-limit", type=int, default=0, help="僅翻譯前 N 個原子字串（試跑/抽樣）")
-    ap.add_argument("--max-workers", type=int, default=10, help="同時並發批次數（1~25）")
+    ap = build_parser()
     args = ap.parse_args()
+    return args.func(args)
 
-    in_path = Path(args.input).expanduser().resolve()
-    if not in_path.exists():
-        print(f"[ERROR] 找不到檔案：{in_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # 目標輸出檔名
-    base = in_path.with_suffix(".epub") if in_path.suffix.lower() == ".mobi" else in_path
-    out_epub = base.with_name(f"{base.stem}.{args.target}.translated.epub")
-
-    # 需要的話先轉 EPUB
-    if in_path.suffix.lower() == ".mobi" and not args.skip_convert:
-        tmp_epub = in_path.with_suffix(".tmp.convert.epub")
-        mobi_to_epub(in_path, tmp_epub)
-        src_epub = tmp_epub
-    else:
-        if in_path.suffix.lower() not in (".epub",):
-            print("[ERROR] 只支援 .mobi 或 .epub 輸入。", file=sys.stderr)
-            sys.exit(1)
-        src_epub = in_path
-
-    try:
-        translate_epub_texts(
-            epub_in=src_epub,
-            epub_out_full=out_epub,
-            target_lang=args.target,
-            model=args.model,
-            max_chars_per_call=args.max_chars_per_call,
-            preview_limit=args.preview_limit,
-            max_workers=args.max_workers,
-        )
-    finally:
-        if src_epub != in_path and src_epub.exists():
-            try:
-                src_epub.unlink()
-            except Exception:
-                pass
 
 if __name__ == "__main__":
     main()
+
