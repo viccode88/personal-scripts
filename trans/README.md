@@ -1,13 +1,13 @@
 ## 電子書轉換與翻譯工具（trans）
 
-現已整合為單一指令：`convert_and_translate.py`
+單一指令：`convert_and_translate.py`
 
 - 子指令 `convert`：批量將 `.mobi`/`.azw3` 轉為 `.epub`（需要 Calibre 的 `ebook-convert`）。
 - 子指令 `translate`：翻譯 `.mobi`/`.epub` 的可見文字並保持排版/圖片/CSS（需要 OpenAI API）。
 
 ### 安裝需求
 - Python 3.9+
-- 建議安裝套件：`requests`, `beautifulsoup4`, `lxml`, `openai`
+- 套件：`requests`, `beautifulsoup4`, `lxml`, `openai`
 - 轉檔：需安裝 Calibre 並提供 `ebook-convert` 指令於 PATH（或使用預設安裝路徑）
 - 翻譯：需設定環境變數 `OPENAI_API_KEY`
 
@@ -30,7 +30,7 @@ python convert_and_translate.py convert --base-dir /path/to/root \
 
 ---
 
-### 子指令：translate（保留排版翻譯）
+### 子指令：translate
 
 將 `.mobi` 先轉為 `.epub`（或直接 `.epub`），抽取 XHTML/XML 可見文字與 `<img alt>`，呼叫 OpenAI 進行翻譯並回填，最後重新封裝。
 
@@ -51,7 +51,7 @@ python convert_and_translate.py translate INPUT(.mobi|.epub) \
 - `--max-workers`：批次並發度（1~25）
 
 #### 範例
-- 試跑小樣：
+- 試跑：
 ```bash
 python convert_and_translate.py translate input.mobi --target zh-TW --model gpt-5 \
   --preview-limit 150 --max-workers 25
@@ -71,8 +71,6 @@ python convert_and_translate.py translate input.epub --target zh-TW --model gpt-
 ---
 
 ### 常見問題
-- 無法找到 `ebook-convert`：
-  - 將 Calibre 安裝後的 `ebook-convert` 放入 PATH，或修改腳本內的預設路徑常數。
 - 模型呼叫失敗或速率限制：
   - 程式內含重試與退避；可降低 `--max-workers` 或 `--max-chars-per-call`。
 
